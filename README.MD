@@ -1737,6 +1737,15 @@ stays unavailable until the application calls `SetAvailable()`. The probe timer 
 only while the pool is unavailable — an available pool holds no extra handle and pays a
 single predictable branch per borrow.
 
+Two further rules are available on the options object, and neither changes anything at its
+default. `FailurePercentageThreshold` (percent, `0` = off) trips on the share of failed
+reports over the reports collected since the breaker last recovered, which catches the
+dependency that fails one call in three and so never produces a streak; `MinimumThroughput`
+holds the ratio back until the sample is big enough, because a single failure out of a single
+report is 100%. `SuccessThreshold` (default `1`) is the recovery side: the half-open breaker
+then waits for that many consecutive healthy probes before it closes, while an explicit
+`SetAvailable()` still closes it immediately.
+
 ### OpenTelemetry metrics (optional package)
 
 `DotNetCore.HayateOP.Extensions.OpenTelemetry` bridges `IHayateMetrics` onto

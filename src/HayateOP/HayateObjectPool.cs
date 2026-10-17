@@ -731,6 +731,14 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
     // disposed on the recovery), so an available pool holds no extra handle and pays one predicted branch.
     private readonly bool _enableCircuitBreaker;
     private readonly int _breakerFailureThreshold;
+
+    // G-18: the settings that widen the trip rule past a consecutive streak, and the one that widens the
+    // recovery rule past a single probe. Snapshotted at construction exactly like the streak threshold, so
+    // ReloadConfig cannot reshape the state machine of a live breaker.
+    private readonly double _breakerPercentageThreshold;
+    private readonly int _breakerMinimumThroughput;
+    private readonly int _breakerSuccessThreshold;
+
     private readonly Func<bool>? _breakerProbe;
     private readonly Action<HayatePoolAvailabilityEventArgs>? _onAvailable;
     private readonly Action<HayatePoolAvailabilityEventArgs>? _onUnavailable;
@@ -744,6 +752,19 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
     // borrowed object's use succeeded (the typical usage reports the failure after the borrow), so a
     // borrow-side reset would make the breaker unreachable.
     private int _breakerFailureStreak;
+
+    // G-18: the sampling window of the percentage rule — every report seen since the breaker last recovered,
+    // of which the failures are counted separately. long rather than int because the window is unbounded for
+    // a pool that never recovers: 2^31 reports is a reachable count on a hot path, and a wrapped counter
+    // would turn a healthy pool's ratio into a meaningless one. Both are written only while the rule is on,
+    // so a pool that leaves it off pays nothing on the report path, and both are reset by every recovery.
+    private long _breakerReportTotal;
+    private long _breakerReportFailures;
+
+    // G-18: consecutive healthy probes seen while the breaker is open. Consulted only when SuccessThreshold
+    // is above 1; cleared by a failed probe and by every recovery, so a run never spans two visits to the
+    // half-open state.
+    private int _breakerProbeSuccessStreak;
 
     // Stopwatch timestamp of the trip (0 = never tripped) and the reason of the trip. Stable while the
     // breaker stays open; the timestamp lets a probe that started before a re-trip recognize stale results.
@@ -920,6 +941,9 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
         // other feature switch; the trip windows stay live on _options so ReloadConfig can tune them.
         _enableCircuitBreaker = _options.EnableCircuitBreaker;
         _breakerFailureThreshold = _options.CircuitBreaker?.FailureThreshold ?? HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        _breakerPercentageThreshold = _options.CircuitBreaker?.FailurePercentageThreshold ?? HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD;
+        _breakerMinimumThroughput = _options.CircuitBreaker?.MinimumThroughput ?? HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT;
+        _breakerSuccessThreshold = _options.CircuitBreaker?.SuccessThreshold ?? HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD;
         _breakerProbe = _options.CircuitBreaker?.Probe;
         _onAvailable = _options.OnAvailable;
         _onUnavailable = _options.OnUnavailable;
@@ -2539,6 +2563,8 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
     /// disabled does nothing, so instrumentation can call it unconditionally.<br />
     /// Each call counts as one consecutive failure; an explicit <see cref="SetAvailable"/> (or a successful
     /// probe) resets the streak, so sporadic failures that survive a recovery are counted from scratch again.
+    /// When <see cref="HayateCircuitBreakerOptions.FailurePercentageThreshold"/> is on, the same call also
+    /// counts into the sampled window and the breaker may trip on the ratio before the streak is reached.
     /// Once the threshold is reached the pool becomes unavailable, a further failure report changes nothing,
     /// and recovery happens either through the configured probe or through <see cref="SetAvailable"/>.
     /// </remarks>
@@ -2548,9 +2574,27 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
 
         // Count the report. A report below the threshold changes nothing but the streak; the recovery path
         // resets it, so the streak only ever reaches the threshold through fresh consecutive failures.
-        if (Interlocked.Increment(ref _breakerFailureStreak) < _breakerFailureThreshold) return;
+        if (Interlocked.Increment(ref _breakerFailureStreak) >= _breakerFailureThreshold)
+        {
+            TripBreaker(reason);
+            return;
+        }
 
-        TripBreaker(reason);
+        // G-18: the percentage rule, when it is on, counts the report into the sampling window and can trip
+        // on the ratio alone — a dependency that fails one call in three never produces a streak, yet it is
+        // plainly broken. A pool that leaves the rule off returns here and performs exactly the single
+        // increment it always did; the window is not even read.
+        if (_breakerPercentageThreshold <= 0d) return;
+
+        var total = Interlocked.Increment(ref _breakerReportTotal);
+        var failures = Interlocked.Increment(ref _breakerReportFailures);
+
+        // Multiplication rather than division on both sides: no divide-by-zero to guard, and the comparison
+        // stays exact where the two ratios would round differently.
+        if (total >= _breakerMinimumThroughput && failures * 100d >= _breakerPercentageThreshold * total)
+        {
+            TripBreaker(reason);
+        }
     }
 
     /// <summary>
@@ -2559,7 +2603,9 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
     /// <remarks>
     /// Closes the circuit breaker and raises <see cref="HayatePoolOptions.OnAvailable"/> — but only when the
     /// pool was actually unavailable; calling it on a pool that is already available just clears the pending
-    /// failure streak and raises nothing. This is the recovery path when no
+    /// failure streak and raises nothing. When <see cref="HayateCircuitBreakerOptions.FailurePercentageThreshold"/>
+    /// is on, the call also counts as a success report in the sampled window — on an available pool that is
+    /// the only success signal the breaker ever sees. This is the recovery path when no
     /// <see cref="HayateCircuitBreakerOptions.Probe"/> is configured. Calling it on a pool whose circuit
     /// breaker is disabled does nothing.
     /// </remarks>
@@ -2570,6 +2616,16 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
         // Clearing the streak is the documented escape hatch for sporadic failures: an application that
         // knows the dependency is fine calls this before the threshold is reached, on an available pool.
         Interlocked.Exchange(ref _breakerFailureStreak, 0);
+
+        // G-18: a success report is the other half of the percentage rule's sample. On an open breaker the
+        // increment is wiped by the window reset in RecoverBreaker, which is intended — that window belongs
+        // to the state being left behind. On an available pool it stands, and it is the only way the ratio
+        // can tell a healthy dependency from one that never answers.
+        if (_breakerPercentageThreshold > 0d)
+        {
+            Interlocked.Increment(ref _breakerReportTotal);
+        }
+
         RecoverBreaker(fromProbe: false, expectedTrippedAt: -1);
     }
 
@@ -2655,6 +2711,13 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
         StopBreakerProbeTimer();
         Interlocked.Exchange(ref _breakerFailureStreak, 0);
 
+        // G-18: the sampling window and the half-open run are cleared here and only here. Both describe the
+        // stretch between two recoveries, so closing the breaker is what starts a new one; the trip path
+        // leaves them alone because nothing reads them again before this line runs.
+        Interlocked.Exchange(ref _breakerReportTotal, 0L);
+        Interlocked.Exchange(ref _breakerReportFailures, 0L);
+        Interlocked.Exchange(ref _breakerProbeSuccessStreak, 0);
+
         try
         {
             _logger.LogInformation("Pool [{PoolName}] back in service ({Trigger}).",
@@ -2699,8 +2762,10 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
     }
 
     /// <summary>
-    /// Probe tick. Runs the configured probe and recovers the pool when it reports healthy; a throwing
-    /// probe is a failed probe and leaves the pool unavailable for the next interval.
+    /// Probe tick. Runs the configured probe and recovers the pool when it reports healthy — or, when
+    /// <see cref="HayateCircuitBreakerOptions.SuccessThreshold"/> asks for more than one, once that many
+    /// consecutive probes have. A throwing probe is a failed probe: it breaks the run and leaves the pool
+    /// unavailable for the next interval.
     /// </summary>
     private void BreakerProbeTick(object? state)
     {
@@ -2730,7 +2795,9 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
         catch (Exception ex)
         {
             // A throwing probe is a failed probe: the pool stays unavailable and is probed again after
-            // the next interval; the exception is logged, never allowed to escape into the timer.
+            // the next interval; the exception is logged, never allowed to escape into the timer. G-18: it
+            // also breaks the half-open run, so the successes counted before it no longer add up.
+            Interlocked.Exchange(ref _breakerProbeSuccessStreak, 0);
             _logger.LogWarning("Availability probe for pool [{PoolName}] threw {ExceptionType}: {ExceptionMessage}; the pool stays unavailable",
                 _name, ex.GetType().Name, ex.Message);
             return;
@@ -2738,8 +2805,27 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
 
         if (healthy)
         {
+            // G-18: the half-open breaker may demand a run of healthy probes rather than a single one. The
+            // default of 1 keeps the historical single-probe recovery, and that case skips the counter
+            // entirely rather than counting to one.
+            if (_breakerSuccessThreshold > 1)
+            {
+                var successes = Interlocked.Increment(ref _breakerProbeSuccessStreak);
+                if (successes < _breakerSuccessThreshold)
+                {
+                    _logger.LogDebug(
+                        "Availability probe for pool [{PoolName}] reported healthy ({Successes}/{Required}); the pool stays unavailable until the run completes",
+                        _name, successes, _breakerSuccessThreshold);
+                    return;
+                }
+            }
+
             RecoverBreaker(fromProbe: true, expectedTrippedAt: trippedAt);
+            return;
         }
+
+        // An unhealthy answer breaks the run: the next success has to start a fresh one.
+        Interlocked.Exchange(ref _breakerProbeSuccessStreak, 0);
     }
 
     /// <summary>

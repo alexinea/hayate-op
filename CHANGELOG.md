@@ -10,6 +10,23 @@ Breaking changes are described in full — with migration guidance — in
 
 ## [Unreleased]
 
+### Added
+
+- **The circuit breaker can now trip on a failure percentage and recover on a run of healthy probes**
+  (G-18): `HayateCircuitBreakerOptions` offered four settings — a consecutive-failure threshold, two
+  probe timings and the probe itself — which covers the dependency that stops answering altogether and
+  misses the one that answers one call in three. Three settings close that gap, and each of them
+  defaults to the behaviour that existed before it. `FailurePercentageThreshold` (percent, `0` = off)
+  trips on the share of failed reports over the reports collected since the breaker last recovered, so
+  a pool whose traffic never builds a streak can still take itself out of service. `MinimumThroughput`
+  holds that ratio back until the sample is big enough, because one failure out of one report is 100%.
+  `SuccessThreshold` (default `1`) is the recovery side: the half-open breaker then waits for that many
+  consecutive healthy probes before it closes. A report is either a failure (`SetUnavailable`) or a
+  success (`SetAvailable`); the two trip rules are alternatives rather than a conjunction, so turning
+  the percentage on cannot make a pool harder to protect; and an explicit `SetAvailable` still closes
+  the breaker at once whatever the run has reached. All three bind from configuration and travel
+  through `CopyTo` / `Equals` / `GetHashCode` like the settings that were already there.
+
 ### Fixed
 
 - **An asynchronous borrow now promotes an aged object to the old generation** (G-19): the generational

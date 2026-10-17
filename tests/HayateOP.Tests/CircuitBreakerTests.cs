@@ -7,6 +7,9 @@ namespace DotNetCore.HayateOP.Tests;
 /// the pool stays unavailable until SetAvailable; the failure streak survives borrows and is cleared by
 /// recovery, so sporadic failures separated by a recovery count from scratch; the lean profile forces the
 /// feature off; the options deep-copy contract keeps mutating a copy from reconfiguring the source.
+/// G-18 (3.2) widens the two rules the breaker runs on: the trip rule gains a failure percentage over a
+/// sampled window with a minimum throughput, and the recovery rule gains a run of consecutive healthy
+/// probes. Every one of them defaults to the behaviour that existed before the setting did.
 /// </summary>
 public class CircuitBreakerTests
 {
@@ -218,6 +221,9 @@ public class CircuitBreakerTests
         original.CircuitBreaker.ResetTimeout = TimeSpan.FromSeconds(11);
         original.CircuitBreaker.ProbeInterval = TimeSpan.FromSeconds(13);
         original.CircuitBreaker.Probe = probe;
+        original.CircuitBreaker.FailurePercentageThreshold = 42.5d;
+        original.CircuitBreaker.MinimumThroughput = 7;
+        original.CircuitBreaker.SuccessThreshold = 2;
 
         var copy = original.CopyTo();
 
@@ -226,6 +232,12 @@ public class CircuitBreakerTests
         Assert.Equal(original.CircuitBreaker, copy.CircuitBreaker);
         Assert.Same(probe, copy.CircuitBreaker.Probe);
         Assert.Equal(original.OnAvailable, copy.OnAvailable);
+
+        // CopyTo and Equals both enumerate the settings by hand, so a setting missing from both would slip
+        // past the equality check above; asserting each one directly is what catches that pair of omissions.
+        Assert.Equal(42.5d, copy.CircuitBreaker.FailurePercentageThreshold);
+        Assert.Equal(7, copy.CircuitBreaker.MinimumThroughput);
+        Assert.Equal(2, copy.CircuitBreaker.SuccessThreshold);
 
         copy.CircuitBreaker.FailureThreshold = 99;
         copy.EnableCircuitBreaker = false;
@@ -241,5 +253,247 @@ public class CircuitBreakerTests
         Assert.Equal(3, raw.CircuitBreaker.FailureThreshold);
         Assert.Equal(TimeSpan.FromSeconds(30), raw.CircuitBreaker.ResetTimeout);
         Assert.Equal(TimeSpan.FromSeconds(5), raw.CircuitBreaker.ProbeInterval);
+
+        // G-18: the three settings added in this window normalize on the same terms — a run below 1, a
+        // negative floor and a percentage outside 0..100 all land on a value the breaker can run with. The
+        // percentage is the one whose default means "off", so an out-of-range value has to land on 0 rather
+        // than switch the rule on behind the caller's back.
+        var outOfRange = new HayatePoolOptions { EnableCircuitBreaker = true };
+        outOfRange.CircuitBreaker.SuccessThreshold = 0;
+        outOfRange.CircuitBreaker.MinimumThroughput = -5;
+        outOfRange.CircuitBreaker.FailurePercentageThreshold = -1d;
+        outOfRange.ApplyFeatureSwitches();
+        Assert.Equal(1, outOfRange.CircuitBreaker.SuccessThreshold);
+        Assert.Equal(0, outOfRange.CircuitBreaker.MinimumThroughput);
+        Assert.Equal(0d, outOfRange.CircuitBreaker.FailurePercentageThreshold);
+
+        var tooHigh = new HayatePoolOptions { EnableCircuitBreaker = true };
+        tooHigh.CircuitBreaker.FailurePercentageThreshold = 150d;
+        tooHigh.ApplyFeatureSwitches();
+        Assert.Equal(100d, tooHigh.CircuitBreaker.FailurePercentageThreshold);
+
+        // NaN compares false against every bound, so a clamp written as a pair of comparisons would let it
+        // through and then make the options unequal to their own copy.
+        var notANumber = new HayatePoolOptions { EnableCircuitBreaker = true };
+        notANumber.CircuitBreaker.FailurePercentageThreshold = double.NaN;
+        notANumber.ApplyFeatureSwitches();
+        Assert.Equal(0d, notANumber.CircuitBreaker.FailurePercentageThreshold);
+        Assert.Equal(notANumber.CircuitBreaker, notANumber.CircuitBreaker.CopyTo());
+    }
+
+    /// <summary>
+    /// G-18: the half-open breaker can be told to wait for a run of healthy probes instead of a single one.
+    /// The probe counts its own calls, so "how many healthy answers it took" is an observable number rather
+    /// than a race against the clock.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void SuccessThreshold_ShouldRequireThatManyConsecutiveHealthyProbes()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        var probeCalls = new int[1];
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 1,
+                ResetTimeout = TimeSpan.FromMilliseconds(50),
+                ProbeInterval = TimeSpan.FromMilliseconds(150),
+                SuccessThreshold = 3,
+                Probe = () => { Interlocked.Increment(ref probeCalls[0]); return true; }
+            })
+            .Build();
+
+        pool.SetUnavailable("dependency down");
+
+        // Two healthy answers are not a run of three, so the pool is still out of service. The third probe
+        // is a full interval away, which is what makes the assertion about state rather than about luck.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (Volatile.Read(ref probeCalls[0]) < 2 && DateTime.UtcNow < deadline) Thread.Sleep(10);
+        Assert.True(Volatile.Read(ref probeCalls[0]) >= 2);
+        Assert.False(pool.CheckAvailable());
+
+        // The third consecutive answer closes the breaker, and the timer stops there: three is the exact
+        // count, not a lower bound.
+        while (!pool.CheckAvailable() && DateTime.UtcNow < deadline) Thread.Sleep(10);
+        Assert.True(pool.CheckAvailable());
+        Assert.Equal(3, Volatile.Read(ref probeCalls[0]));
+    }
+
+    /// <summary>
+    /// G-18: the default is 1, i.e. exactly the behaviour the breaker had before the setting existed — the
+    /// first healthy probe recovers the pool. The counter is what pins it: a default that had quietly become
+    /// 2 would still recover, only one interval later.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void SuccessThreshold_DefaultOfOne_ShouldRecoverOnTheFirstHealthyProbe()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        var probeCalls = new int[1];
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 1,
+                ResetTimeout = TimeSpan.FromMilliseconds(50),
+                ProbeInterval = TimeSpan.FromMilliseconds(150),
+                Probe = () => { Interlocked.Increment(ref probeCalls[0]); return true; }
+            })
+            .Build();
+
+        Assert.Equal(1, pool.GetOptions().CircuitBreaker.SuccessThreshold);
+
+        pool.SetUnavailable("dependency down");
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!pool.CheckAvailable() && DateTime.UtcNow < deadline) Thread.Sleep(10);
+
+        Assert.True(pool.CheckAvailable());
+        Assert.Equal(1, Volatile.Read(ref probeCalls[0]));
+    }
+
+    /// <summary>
+    /// G-18: an unhealthy answer breaks the half-open run, so the successes counted before it no longer add
+    /// up to one. The probe is scripted healthy twice, unhealthy once, healthy afterwards, which puts
+    /// recovery on the sixth answer (2 + 1 + 3); without the reset it would land on the fourth, and that
+    /// difference is the whole point of the case.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void FailedProbe_ShouldBreakTheHalfOpenRun()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        var probeCalls = new int[1];
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 1,
+                ResetTimeout = TimeSpan.FromMilliseconds(50),
+                ProbeInterval = TimeSpan.FromMilliseconds(60),
+                SuccessThreshold = 3,
+                Probe = () => Interlocked.Increment(ref probeCalls[0]) != 3
+            })
+            .Build();
+
+        pool.SetUnavailable("dependency down");
+
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!pool.CheckAvailable() && DateTime.UtcNow < deadline) Thread.Sleep(10);
+
+        Assert.True(pool.CheckAvailable());
+        Assert.Equal(6, Volatile.Read(ref probeCalls[0]));
+    }
+
+    /// <summary>
+    /// G-18: the percentage rule exists for the dependency that fails one call in three — no streak ever
+    /// forms, yet the pool keeps handing out objects that do not work. The consecutive threshold is set out
+    /// of reach, so only the ratio can trip this pool.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void FailurePercentageThreshold_ShouldTripOnTheRatio_WhenNoStreakCanForm()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 100,
+                FailurePercentageThreshold = 50d,
+                MinimumThroughput = 4
+            })
+            .Build();
+
+        // fail, success, fail, success: two failures out of four reports is exactly the threshold, but the
+        // fourth report is a success, and a success is never a reason to take the pool out of service.
+        pool.SetUnavailable("failure 1");
+        pool.SetAvailable();
+        pool.SetUnavailable("failure 2");
+        pool.SetAvailable();
+        Assert.True(pool.CheckAvailable());
+
+        // The next failure puts the window at 3 of 5 = 60% and trips the breaker on that report.
+        pool.SetUnavailable("failure 3");
+        Assert.False(pool.CheckAvailable());
+    }
+
+    /// <summary>
+    /// G-18: the floor keeps a cold pool from tripping on its first report — at any percentage a single
+    /// failure out of a single report is 100%. Four failures out of four reports is far above the 10%
+    /// threshold here, and still nothing happens until the sample reaches the floor.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void MinimumThroughput_ShouldHoldTheRatioBack_UntilTheSampleIsBigEnough()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 100,
+                FailurePercentageThreshold = 10d,
+                MinimumThroughput = 5
+            })
+            .Build();
+
+        for (var i = 0; i < 4; i++) pool.SetUnavailable($"failure {i}");
+        Assert.True(pool.CheckAvailable());
+
+        // The fifth report brings the sample up to the floor, and the same 100% now counts.
+        pool.SetUnavailable("failure 4");
+        Assert.False(pool.CheckAvailable());
+    }
+
+    /// <summary>
+    /// G-18: the sampled window belongs to the stretch between two recoveries, so a pool that just came back
+    /// starts from nothing. Without that reset the failures that tripped the breaker would still be in the
+    /// window and the very next one would take the pool out of service again — the recovery would be
+    /// nominal, and every retry after it would look like a fresh outage.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void PercentageWindow_ShouldStartOver_AfterARecovery()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions
+            {
+                FailureThreshold = 100,
+                FailurePercentageThreshold = 50d,
+                MinimumThroughput = 4
+            })
+            .Build();
+
+        // Three failures out of four reports is 75%, and the fourth report is what reaches the floor.
+        pool.SetUnavailable("failure 1");
+        pool.SetUnavailable("failure 2");
+        pool.SetAvailable();
+        pool.SetUnavailable("failure 3");
+        Assert.False(pool.CheckAvailable());
+
+        pool.SetAvailable();
+        Assert.True(pool.CheckAvailable());
+
+        // One failure out of one report is 100%, but the sample is back below the floor: the window did
+        // start over, so the pool keeps serving.
+        pool.SetUnavailable("failure after recovery");
+        Assert.True(pool.CheckAvailable());
+    }
+
+    /// <summary>
+    /// G-18: with the rule at its default the breaker keeps exactly the behaviour it had — an alternating
+    /// pattern never builds a streak and never trips. Twenty rounds is far more than a percentage rule at any
+    /// sane threshold would tolerate, so a default that had silently switched the rule on would fail here.
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public void PercentageRule_DefaultOff_ShouldLeaveTheStreakAsTheOnlyTripRule()
+    {
+        TestContext.Current.CancellationToken.ThrowIfCancellationRequested();
+        using var pool = BaseBuilder()
+            .WithCircuitBreaker(new HayateCircuitBreakerOptions { FailureThreshold = 3 })
+            .Build();
+
+        Assert.Equal(0d, pool.GetOptions().CircuitBreaker.FailurePercentageThreshold);
+        Assert.Equal(0, pool.GetOptions().CircuitBreaker.MinimumThroughput);
+
+        for (var i = 0; i < 20; i++)
+        {
+            pool.SetUnavailable($"failure {i}");
+            pool.SetAvailable();
+        }
+
+        Assert.True(pool.CheckAvailable());
     }
 }

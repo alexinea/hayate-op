@@ -13,7 +13,12 @@ namespace DotNetCore.HayateOP;
 /// consecutive failures has accumulated, the pool marks itself unavailable and every further acquire fails
 /// immediately instead of handing out objects that are likely to be broken. While unavailable, a background
 /// probe runs on the pool's shared timer — the probe is the only background work the breaker adds, it starts
-/// only when the breaker trips and stops as soon as the pool recovers.
+/// only when the breaker trips and stops as soon as the pool recovers.<br />
+/// Two trip rules are available and either one is enough: a consecutive failure streak
+/// (<see cref="FailureThreshold"/>) and, when enabled, a failure percentage over a sampled window
+/// (<see cref="FailurePercentageThreshold"/> together with <see cref="MinimumThroughput"/>). Recovery is
+/// either a single probe or a run of healthy probes (<see cref="SuccessThreshold"/>), and an explicit
+/// <c>SetAvailable</c> closes the breaker at once whatever the run has reached.
 /// </remarks>
 /// <example>
 /// <code>
@@ -46,6 +51,42 @@ public class HayateCircuitBreakerOptions : IEquatable<HayateCircuitBreakerOption
     /// Boundary: values below 1 are normalized to 1 by <see cref="HayatePoolOptions.ApplyFeatureSwitches"/>.
     /// </remarks>
     public int FailureThreshold { get; set; } = HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+
+    /// <summary>
+    /// Failure percentage, in percent, at which the breaker trips. Default value:
+    /// <see cref="HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD"/> (0, the rule is off).
+    /// </summary>
+    /// <remarks>
+    /// Purpose: complements <see cref="FailureThreshold"/> where a consecutive streak is a poor signal — a
+    /// dependency that fails one call in three never produces three failures back to back, yet it is
+    /// plainly broken. A report is either a failure (<c>SetUnavailable</c>) or a success
+    /// (<c>SetAvailable</c>); the ratio is taken over the reports collected since the breaker last changed
+    /// state, because the window is reset on every trip and every recovery. It therefore describes the
+    /// current run of the breaker rather than the pool's whole lifetime.<br />
+    /// Special case: the two trip rules are alternatives, never a conjunction — the breaker trips when
+    /// <em>either</em> the streak or the percentage is reached, so turning this on cannot make a pool
+    /// harder to protect. The ratio is only evaluated once <see cref="MinimumThroughput"/> reports have
+    /// been collected.<br />
+    /// Boundary: values below 0 (and <c>NaN</c>) are normalized to 0, values above 100 to 100, by
+    /// <see cref="HayatePoolOptions.ApplyFeatureSwitches"/>.
+    /// </remarks>
+    public double FailurePercentageThreshold { get; set; } = HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD;
+
+    /// <summary>
+    /// Number of reports that must have been collected before <see cref="FailurePercentageThreshold"/> is
+    /// evaluated. Default value:
+    /// <see cref="HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT"/> (0).
+    /// </summary>
+    /// <remarks>
+    /// Purpose: keeps a cold pool from tripping on its first report — at a 50% threshold a single failure
+    /// out of a single report is 100% and would take the pool out of service before it had served anything.
+    /// Set it to the smallest sample you consider meaningful (the SNESOXOP reference uses 10).<br />
+    /// Interaction: has no effect while <see cref="FailurePercentageThreshold"/> is 0, because the
+    /// percentage rule itself is off. <see cref="FailureThreshold"/> is unaffected — the streak still trips
+    /// on its own.<br />
+    /// Boundary: values below 0 are normalized to 0 by <see cref="HayatePoolOptions.ApplyFeatureSwitches"/>.
+    /// </remarks>
+    public int MinimumThroughput { get; set; } = HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT;
 
     /// <summary>
     /// How long the pool stays unavailable before the background probe starts.<br />
@@ -88,6 +129,22 @@ public class HayateCircuitBreakerOptions : IEquatable<HayateCircuitBreakerOption
     public Func<bool>? Probe { get; set; }
 
     /// <summary>
+    /// Number of consecutive successful probes required before the open breaker closes again.<br />
+    /// Default value: <see cref="HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD"/> (1).
+    /// </summary>
+    /// <remarks>
+    /// Purpose: one healthy probe proves the dependency answered once, not that it recovered. Raising this
+    /// makes the half-open state demand a run of healthy answers, at the cost of keeping the pool out of
+    /// service for up to <c>SuccessThreshold × ProbeInterval</c> after the dependency comes back.<br />
+    /// Interaction: only the background probe is counted. <c>SetAvailable</c> is the application stating
+    /// that the dependency is healthy, so it closes the breaker immediately whatever this value is. A probe
+    /// that reports unhealthy, throws, or is not configured breaks the run, and the next healthy probe
+    /// starts a fresh one.<br />
+    /// Boundary: values below 1 are normalized to 1 by <see cref="HayatePoolOptions.ApplyFeatureSwitches"/>.
+    /// </remarks>
+    public int SuccessThreshold { get; set; } = HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD;
+
+    /// <summary>
     /// Creates a new <see cref="HayateCircuitBreakerOptions"/> and copies all current settings into it.
     /// </summary>
     /// <returns>A new options instance with the same settings as this one.</returns>
@@ -121,6 +178,9 @@ public class HayateCircuitBreakerOptions : IEquatable<HayateCircuitBreakerOption
         }
 
         options.FailureThreshold = this.FailureThreshold;
+        options.FailurePercentageThreshold = this.FailurePercentageThreshold;
+        options.MinimumThroughput = this.MinimumThroughput;
+        options.SuccessThreshold = this.SuccessThreshold;
         options.ResetTimeout = this.ResetTimeout;
         options.ProbeInterval = this.ProbeInterval;
         options.Probe = this.Probe;
@@ -146,6 +206,9 @@ public class HayateCircuitBreakerOptions : IEquatable<HayateCircuitBreakerOption
         if (ReferenceEquals(this, other)) return true;
 
         return this.FailureThreshold == other.FailureThreshold
+               && this.FailurePercentageThreshold == other.FailurePercentageThreshold
+               && this.MinimumThroughput == other.MinimumThroughput
+               && this.SuccessThreshold == other.SuccessThreshold
                && this.ResetTimeout == other.ResetTimeout
                && this.ProbeInterval == other.ProbeInterval
                && ReferenceEquals(this.Probe, other.Probe);
@@ -166,6 +229,9 @@ public class HayateCircuitBreakerOptions : IEquatable<HayateCircuitBreakerOption
         unchecked
         {
             var hash = this.FailureThreshold;
+            hash = (hash * 397) ^ this.FailurePercentageThreshold.GetHashCode();
+            hash = (hash * 397) ^ this.MinimumThroughput;
+            hash = (hash * 397) ^ this.SuccessThreshold;
             hash = (hash * 397) ^ this.ResetTimeout.GetHashCode();
             hash = (hash * 397) ^ this.ProbeInterval.GetHashCode();
             hash = (hash * 397) ^ (this.Probe?.GetHashCode() ?? 0);

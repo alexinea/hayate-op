@@ -172,6 +172,24 @@
             (corresponds to <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.ProbeInterval"/>).
             </summary>
         </member>
+        <member name="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD">
+            <summary>
+            Default number of consecutive successful probes the open breaker requires before it closes
+            (corresponds to <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.SuccessThreshold"/>).
+            </summary>
+        </member>
+        <member name="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD">
+            <summary>
+            Default failure percentage, in percent, at which the breaker trips; 0 disables the percentage rule
+            (corresponds to <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/>).
+            </summary>
+        </member>
+        <member name="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT">
+            <summary>
+            Default minimum number of reports before the failure percentage is evaluated
+            (corresponds to <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.MinimumThroughput"/>).
+            </summary>
+        </member>
         <member name="T:DotNetCore.HayateOP.Common.HayateDefaultConstruction">
             <summary>
             Runtime resolution of the default object policy and of the default creation factory, for the entry
@@ -351,7 +369,12 @@
             consecutive failures has accumulated, the pool marks itself unavailable and every further acquire fails
             immediately instead of handing out objects that are likely to be broken. While unavailable, a background
             probe runs on the pool's shared timer — the probe is the only background work the breaker adds, it starts
-            only when the breaker trips and stops as soon as the pool recovers.
+            only when the breaker trips and stops as soon as the pool recovers.<br />
+            Two trip rules are available and either one is enough: a consecutive failure streak
+            (<see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailureThreshold"/>) and, when enabled, a failure percentage over a sampled window
+            (<see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/> together with <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.MinimumThroughput"/>). Recovery is
+            either a single probe or a run of healthy probes (<see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.SuccessThreshold"/>), and an explicit
+            <c>SetAvailable</c> closes the breaker at once whatever the run has reached.
             </remarks>
             <example>
             <code>
@@ -382,6 +405,42 @@
             accumulate, and an application that knows the dependency is fine can call <c>SetAvailable</c> at any
             time to clear the pending streak. Set it to 1 to trip on the first report.<br />
             Boundary: values below 1 are normalized to 1 by <see cref="M:DotNetCore.HayateOP.HayatePoolOptions.ApplyFeatureSwitches"/>.
+            </remarks>
+        </member>
+        <member name="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold">
+            <summary>
+            Failure percentage, in percent, at which the breaker trips. Default value:
+            <see cref="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD"/> (0, the rule is off).
+            </summary>
+            <remarks>
+            Purpose: complements <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailureThreshold"/> where a consecutive streak is a poor signal — a
+            dependency that fails one call in three never produces three failures back to back, yet it is
+            plainly broken. A report is either a failure (<c>SetUnavailable</c>) or a success
+            (<c>SetAvailable</c>); the ratio is taken over the reports collected since the breaker last changed
+            state, because the window is reset on every trip and every recovery. It therefore describes the
+            current run of the breaker rather than the pool's whole lifetime.<br />
+            Special case: the two trip rules are alternatives, never a conjunction — the breaker trips when
+            <em>either</em> the streak or the percentage is reached, so turning this on cannot make a pool
+            harder to protect. The ratio is only evaluated once <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.MinimumThroughput"/> reports have
+            been collected.<br />
+            Boundary: values below 0 (and <c>NaN</c>) are normalized to 0, values above 100 to 100, by
+            <see cref="M:DotNetCore.HayateOP.HayatePoolOptions.ApplyFeatureSwitches"/>.
+            </remarks>
+        </member>
+        <member name="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.MinimumThroughput">
+            <summary>
+            Number of reports that must have been collected before <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/> is
+            evaluated. Default value:
+            <see cref="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT"/> (0).
+            </summary>
+            <remarks>
+            Purpose: keeps a cold pool from tripping on its first report — at a 50% threshold a single failure
+            out of a single report is 100% and would take the pool out of service before it had served anything.
+            Set it to the smallest sample you consider meaningful (the SNESOXOP reference uses 10).<br />
+            Interaction: has no effect while <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/> is 0, because the
+            percentage rule itself is off. <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailureThreshold"/> is unaffected — the streak still trips
+            on its own.<br />
+            Boundary: values below 0 are normalized to 0 by <see cref="M:DotNetCore.HayateOP.HayatePoolOptions.ApplyFeatureSwitches"/>.
             </remarks>
         </member>
         <member name="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.ResetTimeout">
@@ -422,6 +481,22 @@
             When this is <c>null</c> no automatic recovery happens: the pool stays unavailable until the
             application calls <c>SetAvailable</c>, which is the right choice when only the caller can know that
             the dependency is back.
+            </remarks>
+        </member>
+        <member name="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.SuccessThreshold">
+            <summary>
+            Number of consecutive successful probes required before the open breaker closes again.<br />
+            Default value: <see cref="F:DotNetCore.HayateOP.Common.HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD"/> (1).
+            </summary>
+            <remarks>
+            Purpose: one healthy probe proves the dependency answered once, not that it recovered. Raising this
+            makes the half-open state demand a run of healthy answers, at the cost of keeping the pool out of
+            service for up to <c>SuccessThreshold × ProbeInterval</c> after the dependency comes back.<br />
+            Interaction: only the background probe is counted. <c>SetAvailable</c> is the application stating
+            that the dependency is healthy, so it closes the breaker immediately whatever this value is. A probe
+            that reports unhealthy, throws, or is not configured breaks the run, and the next healthy probe
+            starts a fresh one.<br />
+            Boundary: values below 1 are normalized to 1 by <see cref="M:DotNetCore.HayateOP.HayatePoolOptions.ApplyFeatureSwitches"/>.
             </remarks>
         </member>
         <member name="M:DotNetCore.HayateOP.HayateCircuitBreakerOptions.CopyTo">
@@ -1440,6 +1515,8 @@
             disabled does nothing, so instrumentation can call it unconditionally.<br />
             Each call counts as one consecutive failure; an explicit <see cref="M:DotNetCore.HayateOP.HayatePoolBasic`1.SetAvailable"/> (or a successful
             probe) resets the streak, so sporadic failures that survive a recovery are counted from scratch again.
+            When <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/> is on, the same call also
+            counts into the sampled window and the breaker may trip on the ratio before the streak is reached.
             Once the threshold is reached the pool becomes unavailable, a further failure report changes nothing,
             and recovery happens either through the configured probe or through <see cref="M:DotNetCore.HayateOP.HayatePoolBasic`1.SetAvailable"/>.
             </remarks>
@@ -1451,7 +1528,9 @@
             <remarks>
             Closes the circuit breaker and raises <see cref="P:DotNetCore.HayateOP.HayatePoolOptions.OnAvailable"/> — but only when the
             pool was actually unavailable; calling it on a pool that is already available just clears the pending
-            failure streak and raises nothing. This is the recovery path when no
+            failure streak and raises nothing. When <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.FailurePercentageThreshold"/>
+            is on, the call also counts as a success report in the sampled window — on an available pool that is
+            the only success signal the breaker ever sees. This is the recovery path when no
             <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.Probe"/> is configured. Calling it on a pool whose circuit
             breaker is disabled does nothing.
             </remarks>
@@ -1498,8 +1577,10 @@
         </member>
         <member name="M:DotNetCore.HayateOP.HayatePoolBasic`1.BreakerProbeTick(System.Object)">
             <summary>
-            Probe tick. Runs the configured probe and recovers the pool when it reports healthy; a throwing
-            probe is a failed probe and leaves the pool unavailable for the next interval.
+            Probe tick. Runs the configured probe and recovers the pool when it reports healthy — or, when
+            <see cref="P:DotNetCore.HayateOP.HayateCircuitBreakerOptions.SuccessThreshold"/> asks for more than one, once that many
+            consecutive probes have. A throwing probe is a failed probe: it breaks the run and leaves the pool
+            unavailable for the next interval.
             </summary>
         </member>
         <member name="M:DotNetCore.HayateOP.HayatePoolBasic`1.ClampToTimerMilliseconds(System.Nullable{System.TimeSpan})">

@@ -1660,9 +1660,12 @@ public class HayatePoolOptions
             CriticalAtRatio = WarnAtRatio;
         }
 
-        // Circuit-breaker normalization: a threshold below 1 would trip on a report that was never made, and a
-        // non-positive window would either probe the failing dependency on every tick or never probe it —
-        // all three fall back to their defaults rather than making the pool unusable.
+        // Circuit-breaker normalization: a threshold below 1 would trip on a report that was never made, a
+        // non-positive window would either probe the failing dependency on every tick or never probe it, and
+        // a percentage outside 0..100 is not a ratio at all. Each one falls back to a value the pool can run
+        // with rather than making the pool unusable. The percentage is the single setting whose default (0)
+        // means "off", so clamping it is not the same as resetting it to a usable value — an out-of-range
+        // value lands on 0 and leaves the percentage rule disabled rather than silently turning it on.
         if (EnableCircuitBreaker)
         {
             var breaker = CircuitBreaker ??= new HayateCircuitBreakerOptions();
@@ -1680,6 +1683,25 @@ public class HayatePoolOptions
             if (breaker.ProbeInterval <= TimeSpan.Zero)
             {
                 breaker.ProbeInterval = TimeSpan.FromSeconds(HayateConstant.DEFAULT_CIRCUIT_BREAKER_PROBE_INTERVAL_SECONDS);
+            }
+
+            if (breaker.SuccessThreshold < 1)
+            {
+                breaker.SuccessThreshold = HayateConstant.DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD;
+            }
+
+            if (breaker.MinimumThroughput < 0)
+            {
+                breaker.MinimumThroughput = HayateConstant.DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT;
+            }
+
+            if (double.IsNaN(breaker.FailurePercentageThreshold) || breaker.FailurePercentageThreshold < 0d)
+            {
+                breaker.FailurePercentageThreshold = HayateConstant.DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD;
+            }
+            else if (breaker.FailurePercentageThreshold > 100d)
+            {
+                breaker.FailurePercentageThreshold = 100d;
             }
         }
     }

@@ -193,5 +193,23 @@ public static class HayateConstant
     /// </summary>
     public const int DEFAULT_CIRCUIT_BREAKER_PROBE_INTERVAL_SECONDS = 5;
 
+    /// <summary>
+    /// Default number of consecutive successful probes the open breaker requires before it closes
+    /// (corresponds to <see cref="HayateCircuitBreakerOptions.SuccessThreshold"/>).
+    /// </summary>
+    public const int DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD = 1;
+
+    /// <summary>
+    /// Default failure percentage, in percent, at which the breaker trips; 0 disables the percentage rule
+    /// (corresponds to <see cref="HayateCircuitBreakerOptions.FailurePercentageThreshold"/>).
+    /// </summary>
+    public const double DEFAULT_CIRCUIT_BREAKER_FAILURE_PERCENTAGE_THRESHOLD = 0d;
+
+    /// <summary>
+    /// Default minimum number of reports before the failure percentage is evaluated
+    /// (corresponds to <see cref="HayateCircuitBreakerOptions.MinimumThroughput"/>).
+    /// </summary>
+    public const int DEFAULT_CIRCUIT_BREAKER_MINIMUM_THROUGHPUT = 0;
+
     #endregion
 }
