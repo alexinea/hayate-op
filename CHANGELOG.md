@@ -10,6 +10,21 @@ Breaking changes are described in full — with migration guidance — in
 
 ## [Unreleased]
 
+### Fixed
+
+- **An asynchronous borrow now promotes an aged object to the old generation** (G-19): the generational
+  optimization has two halves — promote an object older than `GenerationThresholdMs`, and validate the
+  old generation once every `OldGenerationValidationInterval` borrows rather than on every one — and
+  only the synchronous borrow path ran them. `AcquireAsync` read the object's age for lifetime rotation
+  and for nothing else, so a pool whose borrowing went through it promoted nothing: every object stayed
+  young, `TakeSnapshot().ObjectDetails` reported generation 0 for an object that had sat idle far past
+  the threshold, and a `ValidateOnBorrow` pool paid the full validation cost on every borrow that the
+  synchronous path skips. Both halves now sit on the asynchronous path at the positions they occupy on
+  the synchronous one, sharing the single clock read that path already takes, so the switch costs it a
+  subtraction and a compare instead of a second `Stopwatch` call. A pool that leaves the optimization
+  on — the default — sees the two paths agree on promotion and on the validation trace; nothing else
+  changes, and the lean fast path is untouched because it forces the optimization off.
+
 ## [3.1.0] - 2026-10-16
 
 Capability and performance window. Everything a caller of the library touches is a pure addition — a

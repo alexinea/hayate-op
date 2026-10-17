@@ -1863,7 +1863,18 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
                     // boundaries outlive MaxLifeTime while the synchronous path rotated it, which is the
                     // kind of silent asymmetry the rotation exists to remove.
                     var now = Stopwatch.GetTimestamp();
-                    if (_enableLifetimeRotationOnBorrow && now - w.CreatedAt > _maxLifeTicks)
+
+                    // G-19: the age is derived once and consumed twice — by the lifetime rotation below
+                    // and by the generational promotion further down. The synchronous core has shared one
+                    // computation between the two since A3a; this path used to derive it inline for the
+                    // rotation only, which is exactly why the promotion it feeds was missing here.
+                    var ageTicks = 0L;
+                    if (_enableGenerationOptimization || _enableLifetimeRotationOnBorrow)
+                    {
+                        ageTicks = now - w.CreatedAt;
+                    }
+
+                    if (_enableLifetimeRotationOnBorrow && ageTicks > _maxLifeTicks)
                     {
                         if (remainingLifetimeRotations > 0)
                         {
@@ -1897,7 +1908,28 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
                         }
                     }
 
-                    if (_options.ValidateOnBorrow && !_policy.Validate(w.Value))
+                    // G-19: the generational validation skip, on the same terms as the synchronous core.
+                    // The old generation is validated once every OldGenerationValidationInterval borrows;
+                    // leaving it out meant an asynchronous pool paid the full validation cost on every
+                    // borrow that the synchronous one skips. The EnableValidation term is the synchronous
+                    // gate verbatim: ApplyFeatureSwitches already clears ValidateOnBorrow when validation
+                    // is off, so it changes nothing reachable — it keeps the two sites reading alike.
+                    var shouldValidate = _enableValidation && _options.ValidateOnBorrow;
+                    if (_enableGenerationOptimization && shouldValidate && w.Generation == 1)
+                    {
+                        w.ValidationSkipCount++;
+
+                        if (w.ValidationSkipCount < _options.OldGenerationValidationInterval)
+                        {
+                            shouldValidate = false;
+                        }
+                        else
+                        {
+                            w.ValidationSkipCount = 0;
+                        }
+                    }
+
+                    if (shouldValidate && !_policy.Validate(w.Value))
                     {
                         // G-5: the object never reaches the caller, so the loan it would have started
                         // ends here instead.
@@ -1920,6 +1952,14 @@ public partial class HayatePoolBasic<T> : IHayateObjectPool<T>
                     // Which thread took this object (wrapper metadata, see HayateObject<T>.LastGetThreadId).
                     w.LastGetThreadId = Environment.CurrentManagedThreadId;
                     w.LeaseCount++;
+
+                    // G-19: generational promotion, at the same position and on the same rule as the
+                    // synchronous core — an object older than GenerationThresholdMs is marked old, which is
+                    // what makes the skip above apply to it on the borrows that follow.
+                    if (_enableGenerationOptimization && ageTicks > _generationThresholdTicks)
+                    {
+                        w.Generation = 1;
+                    }
 
                     if (_enableDiagnostics) Interlocked.Increment(ref _totalAcquired);
 
