@@ -1505,12 +1505,26 @@ public class HayatePoolOptions
     {
         // Lean fast-path normalization. Declared first so the sharding branch below collapses the
         // pool to a single shard exactly as it would for an explicitly sharding-free pool.
-        // Lean stores the pooled value directly in a bounded array and moves it through Interlocked
-        // operations, so it structurally has nowhere to keep per-object timestamps, generations,
-        // leak forensics, metrics samples, capacity-alarm levels or shard free lists. Rather than
-        // rejecting such a combination (which would make builder call order significant), the mode
-        // simply wins and the conflicting features are switched off — the normalized configuration
-        // is then visible through GetOptions.
+        //
+        // CQ-1 — the rule this file's three lean-conflict sites share. A switch that promises a bound
+        // or a guarantee cannot be silently switched off: the owner would go on believing the bound
+        // holds, and nothing in the pool would contradict them. A switch that promises a capability
+        // the mode deliberately omits is normalized instead — "lean runs none of these" is the mode's
+        // documented meaning, GetOptions() shows the collapsed state, and no promise is broken. So:
+        // guarantee ⇒ refuse to build, capability ⇒ normalize. Call order plays no part in either
+        // verdict: every setter writes its value unconditionally and normalization runs once, after
+        // the last builder call, which is why the two verdicts cannot differ by call sequence.
+        //
+        // Where the verdict lands is a separate question. IsValid() carries the ones the options alone
+        // decide; Build() carries the ones whose message has to name the call to remove, or that
+        // involve a registration the options cannot see (the borrow-order guard is options-decidable
+        // and sits there only to share that message shape with its neighbours — a placement, not a
+        // second rule).
+        //
+        // The switches below are the capability half: lean stores the pooled value directly in a
+        // bounded array and moves it through Interlocked operations, so it has nowhere to keep
+        // per-object timestamps, generations, leak forensics, metrics samples, capacity-alarm levels
+        // or shard free lists.
         if (EnableLean)
         {
             EnableSharding = false;
@@ -1705,10 +1719,10 @@ public class HayatePoolOptions
         // Active-object ceiling (G-5): 0 disables it. A live one has to sit at or below the hard ceiling,
         // for the same reason SoftCapacity does — above it the pool could never have that many objects out
         // at once, so the check could never fire and the setting would be a knob that silently does
-        // nothing. The lean fast path keeps no borrow bookkeeping, so it cannot honour a ceiling either;
-        // rejecting the combination is the same "cannot be honoured" rule that rejects
-        // EnableLifetimeRotationOnBorrow, and it is order-independent, whereas normalizing it away would
-        // make builder call order significant.
+        // nothing. The lean fast path keeps no borrow bookkeeping, so it cannot honour a ceiling either.
+        // This is the guarantee half of the CQ-1 rule stated in ApplyFeatureSwitches: a ceiling the owner
+        // asked for is not a capability to drop, so the pool refuses to build instead of quietly running
+        // without it.
         if (MaxActiveObjects < 0) return false;
         if (MaxActiveObjects > 0 && MaxActiveObjects > MaxPoolSize) return false;
         if (EnableLean && MaxActiveObjects > 0) return false;
@@ -1734,10 +1748,10 @@ public class HayatePoolOptions
         // A3a: the lean fast path stores pooled values directly in a bounded array, keeps no per-object
         // timestamps and therefore cannot evaluate an object's age — the borrow-side lifetime rotation
         // can never run there. Every other feature switch lean cannot honour is normalized away by
-        // ApplyFeatureSwitches ("the mode wins"), but this one is rejected instead: silently switching it
-        // off would leave an owner who believes objects are being rotated on hand-out while they are
-        // not, which is the exact failure this switch exists to remove. Rejecting is also
-        // order-independent, whereas normalizing it away would make builder call order significant.
+        // ApplyFeatureSwitches ("the mode wins"), but this one is rejected instead, and it is the second
+        // guarantee of the CQ-1 rule stated there: silently switching the rotation off would leave an
+        // owner who believes objects are being rotated on hand-out while they are not, which is the exact
+        // failure this switch exists to remove.
         if (EnableLean && EnableLifetimeRotationOnBorrow) return false;
 
         if (EnableSharding)

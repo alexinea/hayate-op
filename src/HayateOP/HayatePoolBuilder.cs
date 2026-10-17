@@ -2084,7 +2084,10 @@ public class HayatePoolBuilder<T> where T : class
         // in a bounded buffer and holds no ordered idle list, so no order but the default can be
         // honoured there. The default (FIFO) is what a pool that never asked for anything holds, so
         // that combination stays valid — the guard fires only on a request it cannot satisfy, which is
-        // what keeps the switch from being an option that is accepted and then ignored.
+        // what keeps the switch from being an option that is accepted and then ignored. A borrow order is
+        // a guarantee rather than a capability, so the CQ-1 rule stated in ApplyFeatureSwitches says
+        // refuse; the verdict is raised here rather than in IsValid() to share the message shape with the
+        // two guards around it, which do need registrations the options cannot see.
         if (_options.EnableLean && _options.BorrowStrategy != HayateBorrowStrategy.Fifo)
         {
             throw new InvalidOperationException(
