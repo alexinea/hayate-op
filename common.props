@@ -11,11 +11,12 @@
     </PropertyGroup>
 
     <!-- 2.9 构建门禁：把 src 的「零警告」从声称变为可执行——任何编译器 / 分析器警告即构建失败。
-         作用域恰好是 src：本文件只被 10 个 src 项目 Import。tests/ 自 3.1 / A5-6 起另有一道同口径的
-         门禁，落在 tests/Directory.Build.props，覆盖该目录下全部 16 个工程（13 测试 + 3 工具）；
-         不并进本文件、也不放进 common.tests.props，是因为 tests/ 的 16 个工程里只有 4 个 Import 了
-         common.tests.props，逐个 Import 会在新增工程时被漏掉。全量非增量实测：Release 与 Debug 下
-         10 个 src 项目、各自全部 TFM 均 0 警告 0 错误。
+         作用域恰好是 src：本文件只被 src/ 下的全部项目 Import —— 这里刻意不写死个数：G-12 加入
+         分析器包时它漂过一次（10 → 11），靠人工维护的数字必然过期。tests/ 自 3.1 / A5-6 起另有
+         一道同口径的门禁，落在 tests/Directory.Build.props，覆盖该目录下全部 16 个工程
+         （13 测试 + 3 工具）；不并进本文件、也不放进 common.tests.props，是因为 tests/ 的 16 个
+         工程里只有 4 个 Import 了 common.tests.props，逐个 Import 会在新增工程时被漏掉。全量
+         非增量实测：Release 与 Debug 下 src 下的全部项目、各自全部 TFM 均 0 警告 0 错误。
          之所以要落到这里：`Extensions.Endpoints` 曾因 net10.0 的 ASPDEPR002（`WithOpenApi` 过时）
          静默产出 14 条诊断，而当时门禁只被人工对着 core 一个项目跑过 ⇒ 无强制执行的口径必然漂移。
          一次性绕过（仅限本地排障）：dotnet build <proj> /p:TreatWarningsAsErrors=false -->
